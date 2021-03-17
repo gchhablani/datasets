@@ -40,7 +40,7 @@ from tqdm.auto import tqdm
 
 from . import config
 from .arrow_reader import ArrowReader
-from .arrow_writer import ArrowWriter, TypedSequence
+from .arrow_writer import ArrowWriter, OptimizedTypedSequence
 from .features import Features, Value, cast_to_python_objects
 from .filesystems import extract_path_from_uri, is_remote_filesystem
 from .fingerprint import (
@@ -58,6 +58,7 @@ from .splits import NamedSplit
 from .utils import map_nested
 from .utils.deprecation_utils import deprecated
 from .utils.logging import WARNING, get_logger, get_verbosity, set_verbosity_warning
+from .utils.typing import PathLike
 
 
 if TYPE_CHECKING:
@@ -69,8 +70,6 @@ if int(pa.__version__.split(".")[0]) == 0:
     PYARROW_V0 = True
 else:
     PYARROW_V0 = False
-
-PathLike = Union[str, bytes, os.PathLike]
 
 
 class DatasetInfoMixin(object):
@@ -429,11 +428,40 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
         else:
             mapping = cast_to_python_objects(mapping)
         mapping = {
-            col: TypedSequence(data, type=features.type[col].type if features is not None else None)
+            col: OptimizedTypedSequence(data, type=features.type[col].type if features is not None else None, col=col)
             for col, data in mapping.items()
         }
         pa_table: pa.Table = pa.Table.from_pydict(mapping=mapping)
         return cls(pa_table, info=info, split=split)
+
+    @staticmethod
+    def from_csv(
+        path_or_paths: Union[PathLike, List[PathLike]],
+        split: Optional[NamedSplit] = None,
+        features: Optional[Features] = None,
+        cache_dir: str = None,
+        keep_in_memory: bool = False,
+        **kwargs,
+    ):
+        """Create Dataset from CSV file(s).
+
+        Args:
+            path_or_paths (path-like or list of path-like): Path(s) of the CSV file(s).
+            split (NamedSplit, optional): Split name to be assigned to the dataset.
+            features (Features, optional): Dataset features.
+            cache_dir (str, optional, default="~/datasets"): Directory to cache data.
+            keep_in_memory (bool, default=False): Whether to copy the data in-memory.
+            **kwargs: Keyword arguments to be passed to :meth:`pandas.read_csv`.
+
+        Returns:
+            datasets.Dataset
+        """
+        # Dynamic import to avoid circular dependency
+        from .io.csv import CsvDatasetReader
+
+        return CsvDatasetReader(
+            path_or_paths, split=split, features=features, cache_dir=cache_dir, keep_in_memory=keep_in_memory, **kwargs
+        ).read()
 
     def __del__(self):
         if hasattr(self, "_data"):
@@ -444,7 +472,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_info"] = json.dumps(asdict(state["_info"]))
-        state["_split"] = str(state["_split"]) if state["_split"] is not None else None
+        state["_split"] = str(state["_split"]) if isinstance(state["_split"], NamedSplit) else state["_split"]
         if self._data_files:
             state["_data"] = None
         if self._indices_data_files:
@@ -459,7 +487,7 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
         ), "tried to unpickle a dataset without arrow_table or data_files"
         state = state.copy()
         state["_info"] = DatasetInfo.from_dict(json.loads(state["_info"]))
-        state["_split"] = NamedSplit(state["_split"]) if state["_split"] is not None else None
+        state["_split"] = NamedSplit(state["_split"]) if isinstance(state["_split"], str) else state["_split"]
         self.__dict__ = state
         reader = ArrowReader("", self.info)
         # Read arrow tables
@@ -507,16 +535,16 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
             if self._indices is not None:
                 if not self._indices_data_files:
                     cache_file_name = os.path.join(temp_dataset_path, "indices.arrow")
-                    writer = ArrowWriter(path=cache_file_name)
-                    writer.write_table(self._indices)
-                    writer.finalize()
+                    with ArrowWriter(path=cache_file_name) as writer:
+                        writer.write_table(self._indices)
+                        writer.finalize()
                     self._indices_data_files = [{"filename": cache_file_name}]
             # Write dataset if needed
             if not self._data_files or any(len(h["transforms"]) > 0 for h in self._inplace_history):
                 cache_file_name = os.path.join(temp_dataset_path, "dataset.arrow")
-                writer = ArrowWriter(path=cache_file_name)
-                writer.write_table(self._data)
-                writer.finalize()
+                with ArrowWriter(path=cache_file_name) as writer:
+                    writer.write_table(self._data)
+                    writer.finalize()
                 self._data_files = [{"filename": cache_file_name}]
                 self._inplace_history = [{"transforms": []}]
             # Copy all files into the dataset directory
@@ -855,10 +883,19 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
         if not new_column_name:
             raise ValueError("New column name is empty.")
 
-        new_column_names = [new_column_name if col == original_column_name else col for col in self._data.column_names]
+        def rename(columns):
+            return [new_column_name if col == original_column_name else col for col in columns]
 
-        self._info.features[new_column_name] = self._info.features[original_column_name]
-        del self._info.features[original_column_name]
+        new_column_names = rename(self._data.column_names)
+        if self._format_columns is not None:
+            self._format_columns = rename(self._format_columns)
+
+        self._info.features = Features(
+            {
+                new_column_name if col == original_column_name else col: feature
+                for col, feature in self._info.features.items()
+            }
+        )
 
         self._data = self._data.rename_columns(new_column_names)
 
@@ -890,10 +927,19 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
         if not new_column_name:
             raise ValueError("New column name is empty.")
 
-        new_column_names = [new_column_name if col == original_column_name else col for col in self._data.column_names]
+        def rename(columns):
+            return [new_column_name if col == original_column_name else col for col in columns]
 
-        dataset._info.features[new_column_name] = dataset._info.features[original_column_name]
-        del dataset._info.features[original_column_name]
+        new_column_names = rename(self._data.column_names)
+        if self._format_columns is not None:
+            dataset._format_columns = rename(self._format_columns)
+
+        dataset._info.features = Features(
+            {
+                new_column_name if col == original_column_name else col: feature
+                for col, feature in self._info.features.items()
+            }
+        )
 
         dataset._data = dataset._data.rename_columns(new_column_names)
         dataset._fingerprint = new_fingerprint
@@ -1550,46 +1596,50 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
                     fingerprint=new_fingerprint,
                     disable_nullable=disable_nullable,
                 )
+        else:
+            # we don't need a writer so we use an empty context
+            writer = contextlib.ExitStack()
 
-        try:
-            # Loop over single examples or batches and write to buffer/file if examples are to be updated
-            pbar_iterable = self if not batched else range(0, len(self), batch_size)
-            pbar_unit = "ex" if not batched else "ba"
-            pbar_desc = "#" + str(rank) if rank is not None else None
-            pbar = tqdm(pbar_iterable, disable=not_verbose, position=rank, unit=pbar_unit, desc=pbar_desc)
-            if not batched:
-                for i, example in enumerate(pbar):
-                    example = apply_function_on_filtered_inputs(example, i, offset=offset)
-                    if update_data:
-                        example = cast_to_python_objects(example)
-                        writer.write(example)
-            else:
-                for i in pbar:
-                    if drop_last_batch and i + batch_size > self.num_rows:
-                        continue
-                    batch = self[i : i + batch_size]
-                    indices = list(range(*(slice(i, i + batch_size).indices(self.num_rows))))  # Something simpler?
-                    try:
-                        batch = apply_function_on_filtered_inputs(
-                            batch, indices, check_same_num_examples=len(self.list_indexes()) > 0, offset=offset
-                        )
-                    except NumExamplesMismatch:
-                        raise DatasetTransformationNotAllowedError(
-                            "Using `.map` in batched mode on a dataset with attached indexes is allowed only if it doesn't create or remove existing examples. You can first run `.drop_index() to remove your index and then re-add it."
-                        )
-                    if update_data:
-                        batch = cast_to_python_objects(batch)
-                        writer.write_batch(batch)
-            if update_data:
-                writer.finalize()  # close_stream=bool(buf_writer is None))  # We only close if we are writing in a file
-        except (Exception, KeyboardInterrupt):
-            if update_data:
-                writer.finalize()
-            if update_data and tmp_file is not None:
-                tmp_file.close()
-                if os.path.exists(tmp_file.name):
-                    os.remove(tmp_file.name)
-            raise
+        with writer:
+            try:
+                # Loop over single examples or batches and write to buffer/file if examples are to be updated
+                pbar_iterable = self if not batched else range(0, len(self), batch_size)
+                pbar_unit = "ex" if not batched else "ba"
+                pbar_desc = "#" + str(rank) if rank is not None else None
+                pbar = tqdm(pbar_iterable, disable=not_verbose, position=rank, unit=pbar_unit, desc=pbar_desc)
+                if not batched:
+                    for i, example in enumerate(pbar):
+                        example = apply_function_on_filtered_inputs(example, i, offset=offset)
+                        if update_data:
+                            example = cast_to_python_objects(example)
+                            writer.write(example)
+                else:
+                    for i in pbar:
+                        if drop_last_batch and i + batch_size > self.num_rows:
+                            continue
+                        batch = self[i : i + batch_size]
+                        indices = list(range(*(slice(i, i + batch_size).indices(self.num_rows))))  # Something simpler?
+                        try:
+                            batch = apply_function_on_filtered_inputs(
+                                batch, indices, check_same_num_examples=len(self.list_indexes()) > 0, offset=offset
+                            )
+                        except NumExamplesMismatch:
+                            raise DatasetTransformationNotAllowedError(
+                                "Using `.map` in batched mode on a dataset with attached indexes is allowed only if it doesn't create or remove existing examples. You can first run `.drop_index() to remove your index and then re-add it."
+                            )
+                        if update_data:
+                            batch = cast_to_python_objects(batch)
+                            writer.write_batch(batch)
+                if update_data:
+                    writer.finalize()  # close_stream=bool(buf_writer is None))  # We only close if we are writing in a file
+            except (Exception, KeyboardInterrupt):
+                if update_data:
+                    writer.finalize()
+                if update_data and tmp_file is not None:
+                    tmp_file.close()
+                    if os.path.exists(tmp_file.name):
+                        os.remove(tmp_file.name)
+                raise
 
         if update_data and tmp_file is not None:
             tmp_file.close()
@@ -1833,15 +1883,16 @@ class Dataset(DatasetInfoMixin, IndexableMixin):
 
         indices_table = pa.Table.from_arrays([indices_array], names=["indices"])
 
-        try:
-            writer.write_table(indices_table)
-            writer.finalize()  # close_stream=bool(buf_writer is None))  # We only close if we are writing in a file
-        except (Exception, KeyboardInterrupt):
-            if tmp_file is not None:
-                tmp_file.close()
-                if os.path.exists(tmp_file.name):
-                    os.remove(tmp_file.name)
-            raise
+        with writer:
+            try:
+                writer.write_table(indices_table)
+                writer.finalize()  # close_stream=bool(buf_writer is None))  We only close if we are writing in a file
+            except (Exception, KeyboardInterrupt):
+                if tmp_file is not None:
+                    tmp_file.close()
+                    if os.path.exists(tmp_file.name):
+                        os.remove(tmp_file.name)
+                raise
 
         if tmp_file is not None:
             tmp_file.close()
